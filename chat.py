@@ -17,7 +17,7 @@ RM이 위험한 조항을 찾아내어 법적 근거와 함께 판결해 드립�
 # ==========================================
 with st.sidebar:
     st.header("📚 지식 베이스 관리")
-    st.info("법령 PDF와 약관 PDF를 여기에 업로드하여 학습시키세요.")
+    st.info("궁금한 약관 PDF를 여기에 업로드하여 학습시키세요.")
 
     uploaded_files = st.file_uploader(
         "PDF 파일 업로드 (다중 선택 가능)", type=["pdf"], accept_multiple_files=True
