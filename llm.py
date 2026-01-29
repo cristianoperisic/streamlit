@@ -1,146 +1,99 @@
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import (
-    ChatPromptTemplate,
-    MessagesPlaceholder,
-    FewShotChatMessagePromptTemplate,
-)
-from langchain_classic.chains import (
-    create_history_aware_retriever,
-    create_retrieval_chain,
-)
-from langchain_classic.chains.combine_documents import create_stuff_documents_chain
-from langchain_openai import ChatOpenAI
-from langchain_openai import OpenAIEmbeddings
+import os
+import tempfile
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 from langchain_pinecone import PineconeVectorStore
-
-from langchain_community.chat_message_histories import ChatMessageHistory
-from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.runnables.history import RunnableWithMessageHistory
-
-from config import answer_examples
-
-store = {}
+from langchain_classic.chains import RetrievalQA
+from langchain_core.prompts import PromptTemplate
+import config
 
 
-def get_session_history(session_id: str) -> BaseChatMessageHistory:
-    if session_id not in store:
-        store[session_id] = ChatMessageHistory()
-    return store[session_id]
+# 1. 문서 업로드 및 학습 함수
+def embed_documents(uploaded_files):
+    documents = []
+
+    for uploaded_file in uploaded_files:
+        try:
+            # Streamlit 업로드 파일을 임시 파일로 저장
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                tmp_file.write(uploaded_file.read())
+                tmp_path = tmp_file.name
+
+            loader = PyPDFLoader(tmp_path)
+            docs = loader.load()
+
+            # 메타데이터(출처) 추가
+            for doc in docs:
+                doc.metadata["source"] = uploaded_file.name
+
+            documents.extend(docs)
+            os.remove(tmp_path)
+
+        except Exception as e:
+            return False, f"파일 처리 중 오류 발생: {uploaded_file.name} - {e}"
+
+    if documents:
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000, chunk_overlap=200
+        )
+        split_texts = text_splitter.split_documents(documents)
+
+        embeddings = OpenAIEmbeddings(openai_api_key=config.OPENAI_API_KEY)
+
+        # [수정 포인트 1] pinecone_api_key 인자 제거 (환경변수 자동 인식)
+        PineconeVectorStore.from_documents(
+            documents=split_texts,
+            embedding=embeddings,
+            index_name=config.PINECONE_INDEX_NAME,
+        )
+        return (
+            True,
+            f"총 {len(split_texts)}개의 데이터가 데이터베이스에 저장되었습니다.",
+        )
+
+    return False, "처리할 텍스트가 없습니다."
 
 
-def get_retriever():
-    embedding = OpenAIEmbeddings(model="text-embedding-3-large")
-    index_name = "tax-markdown-index"
-    database = PineconeVectorStore.from_existing_index(
-        index_name=index_name, embedding=embedding
-    )
-    retriever = database.as_retriever(search_kwargs={"k": 4})
-    return retriever
-
-
-def get_history_retriever():
-    llm = get_llm()
-    retriever = get_retriever()
-
-    contextualize_q_system_prompt = (
-        "Given a chat history and the latest user question "
-        "which might reference context in the chat history, "
-        "formulate a standalone question which can be understood "
-        "without the chat history. Do NOT answer the question, "
-        "just reformulate it if needed and otherwise return it as is."
-    )
-
-    contextualize_q_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", contextualize_q_system_prompt),
-            MessagesPlaceholder("chat_history"),
-            ("human", "{input}"),
-        ]
-    )
-
-    history_aware_retriever = create_history_aware_retriever(
-        llm, retriever, contextualize_q_prompt
-    )
-    return history_aware_retriever
-
-
-def get_llm(model="gpt-4o"):
-    llm = ChatOpenAI(model=model)
-    return llm
-
-
-def get_dictionary_chain():
-    dictionary = ["사람을 나타내는 표현 -> 거주자"]
-    llm = get_llm()
-    prompt = ChatPromptTemplate.from_template(
-        f"""
-        사용자의 질문을 보고, 우리의 사전을 참고해서 사용자의 질문을 변경해주세요.
-        만약 변경할 필요가 없다고 판단된다면, 사용자의 질문을 변경하지 않아도 됩니다.
-        그런 경우에는 질문만 리턴해주세요
-        사전: {dictionary}
-        
-        질문: {{question}}
-    """
-    )
-
-    dictionary_chain = prompt | llm | StrOutputParser()
-
-    return dictionary_chain
-
-
+# 2. 챗봇 엔진 (RAG Chain)
 def get_rag_chain():
-    llm = get_llm()
-    example_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("human", "{input}"),
-            ("ai", "{answer}"),
-        ]
-    )
-    few_shot_prompt = FewShotChatMessagePromptTemplate(
-        example_prompt=example_prompt,
-        examples=answer_examples,
-    )
-    system_prompt = (
-        "당신은 소득세법 전문가입니다. 사용자의 소득세법에 관한 질문에 답변해주세요"
-        "아래에 제공된 문서를 활용해서 답변해주시고"
-        "답변을 알 수 없다면 모른다고 답변해주세요"
-        "답변을 제공할 때는 소득세법 (XX조)에 따르면 이라고 시작하면서 답변해주시고"
-        "2-3 문장정도의 짧은 내용의 답변을 원합니다"
-        "\n\n"
-        "{context}"
+    embeddings = OpenAIEmbeddings(openai_api_key=config.OPENAI_API_KEY)
+
+    # [수정 포인트 2] pinecone_api_key 인자 제거
+    vectorstore = PineconeVectorStore.from_existing_index(
+        index_name=config.PINECONE_INDEX_NAME, embedding=embeddings
     )
 
-    qa_prompt = ChatPromptTemplate.from_messages(
-        [
-            ("system", system_prompt),
-            few_shot_prompt,
-            MessagesPlaceholder("chat_history"),
-            ("human", "{input}"),
-        ]
-    )
-    history_aware_retriever = get_history_retriever()
-    question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
+    # 전문적인 톤의 프롬프트
+    template = """
+    당신은 법률 문서 분석을 지원하는 AI 어시스턴트입니다.
+    제공된 [데이터베이스]의 내용을 바탕으로 사용자의 질문에 답변하십시오.
+    
+    [지시사항]
+    1. 사용자의 질문에 대해 '데이터베이스에 있는 법적 기준(법령, 지침)'과 '대상 약관'을 비교하여 분석하십시오.
+    2. 감정적인 표현이나 불필요한 수식어를 배제하고, 사실 위주로 건조하게 서술하십시오.
+    3. 답변의 근거가 되는 조항이나 파일명을 명시하여 신뢰도를 높이십시오.
+    
+    [답변 양식]
+    - 검토 결과: (문제 없음 / 검토 필요 / 위반 소지 있음)
+    - 상세 분석: (법적 기준과 약관 내용을 대조하여 설명)
+    - 참고 문헌: (정보 출처 파일명 표기)
 
-    rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
+    Context: {context}
+    Question: {question}
+    Answer:
+    """
+    PROMPT = PromptTemplate(template=template, input_variables=["context", "question"])
 
-    conversational_rag_chain = RunnableWithMessageHistory(
-        rag_chain,
-        get_session_history,
-        input_messages_key="input",
-        history_messages_key="chat_history",
-        output_messages_key="answer",
-    ).pick("answer")
-
-    return conversational_rag_chain
-
-
-def get_ai_response(user_message):
-    dictionary_chain = get_dictionary_chain()
-    rag_chain = get_rag_chain()
-    tax_chain = {"input": dictionary_chain} | rag_chain
-    ai_response = tax_chain.stream(
-        {"question": user_message},
-        config={"configurable": {"session_id": "abc123"}},
+    llm = ChatOpenAI(
+        model_name="gpt-4o", temperature=0, openai_api_key=config.OPENAI_API_KEY
     )
 
-    return ai_response
+    qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        chain_type="stuff",
+        retriever=vectorstore.as_retriever(search_kwargs={"k": 5}),
+        chain_type_kwargs={"prompt": PROMPT},
+    )
+
+    return qa_chain

@@ -1,35 +1,85 @@
 import streamlit as st
+import llm  # llm.py 로직 가져오기
 
+# 페이지 설정
+st.set_page_config(page_title="Project RM", page_icon="⚖️", layout="wide")
 
-from dotenv import load_dotenv
+st.title("⚖️ Project RM: 불공정 약관 심판관")
+st.markdown(
+    """
+법적 기준(약관법, 분쟁해결기준)과 분석할 약관(넷플릭스, 카카오톡 등)을 업로드하세요.
+RM이 위험한 조항을 찾아내어 법적 근거와 함께 판결해 드립니다.
+"""
+)
 
+# ==========================================
+# [사이드바] 관리자용: 문서 학습
+# ==========================================
+with st.sidebar:
+    st.header("📚 지식 베이스 관리")
+    st.info("법령 PDF와 약관 PDF를 여기에 업로드하여 학습시키세요.")
 
-from llm import get_ai_response
+    uploaded_files = st.file_uploader(
+        "PDF 파일 업로드 (다중 선택 가능)", type=["pdf"], accept_multiple_files=True
+    )
 
-st.set_page_config(page_title="소득세 챗봇", page_icon="🤖")
+    # 업로드 버튼을 눌렀을 때만 동작하게 하려면 버튼 추가 가능 (여기선 자동 처리)
+    if uploaded_files:
+        if st.button("지식 베이스에 업로드 및 학습 시작"):
+            with st.spinner("문서를 분석하고 Pinecone에 저장 중입니다..."):
+                success, message = llm.embed_documents(uploaded_files)
+                if success:
+                    st.success(f"✅ 학습 완료! {message}")
+                else:
+                    st.error(f"❌ 학습 실패: {message}")
 
-st.title("🤖 소득세 챗봇")
-st.caption("소득세에 관련된 모든것을 답해드립니다!")
+    st.divider()
+    st.caption("Powered by LangChain & Pinecone")
 
-load_dotenv()
+# ==========================================
+# [메인] 사용자용: 채팅 인터페이스
+# ==========================================
 
-if "message_list" not in st.session_state:
-    st.session_state.message_list = []
+# 1. 대화 기록 초기화
+if "messages" not in st.session_state:
+    st.session_state["messages"] = [
+        {
+            "role": "assistant",
+            "content": "안녕하세요! RM입니다. 약관 파일들을 학습시키셨나요? 궁금한 점을 물어봐 주세요.",
+        }
+    ]
 
-for message in st.session_state.message_list:
-    with st.chat_message(message["role"]):
-        st.write(message["content"])
+# 2. 이전 대화 출력
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"])
 
-
-if user_question := st.chat_input(
-    placeholder="소득세에 관련된 궁금한 내용들을 말씀해주세요!"
-):
+# 3. 사용자 입력 처리
+if user_input := st.chat_input("질문을 입력하세요 (예: 넷플릭스 환불 규정은 공정해?)"):
+    # 사용자 메시지 표시 및 저장
+    st.session_state.messages.append({"role": "user", "content": user_input})
     with st.chat_message("user"):
-        st.write(user_question)
-    st.session_state.message_list.append({"role": "user", "content": user_question})
+        st.write(user_input)
 
-    with st.spinner("답변을 생성하는 중입니다"):
-        ai_response = get_ai_response(user_question)
-        with st.chat_message("ai"):
-            ai_message = st.write_stream(ai_response)
-            st.session_state.message_list.append({"role": "ai", "content": ai_message})
+    # 4. 답변 생성
+    with st.chat_message("assistant"):
+        with st.spinner("법령과 약관을 대조하여 판결 중..."):
+            try:
+                # RAG 체인 가져오기
+                qa_chain = llm.get_rag_chain()
+
+                # 답변 요청
+                response = qa_chain.invoke({"query": user_input})
+                result_text = response["result"]
+
+                st.write(result_text)
+
+                # 답변 저장
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": result_text}
+                )
+
+            except Exception as e:
+                st.error(
+                    f"죄송합니다. 답변을 생성하는 중 오류가 발생했습니다.\n\n오류 내용: {e}"
+                )
